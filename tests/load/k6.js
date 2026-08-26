@@ -1,0 +1,1 @@
+import http from 'k6/http';import {check,sleep} from 'k6';export const options={scenarios:{baseline:{executor:'constant-vus',vus:100,duration:'30s'}}};export default function(){const r=http.get(`${__ENV.BASE_URL||'http://localhost:4000'}/health`);check(r,{'health is 200':x=>x.status===200});sleep(1)}
