@@ -1,0 +1,33 @@
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
+import argon2 from 'argon2';
+import jwt from 'jsonwebtoken';
+import { PrismaClient, Role } from '@prisma/client';
+import Redis from 'ioredis';
+dotenv.config();
+const app=express(), prisma=new PrismaClient(), redis=new Redis(process.env.REDIS_URL||'redis://localhost:6379');
+const PORT=Number(process.env.API_PORT||4000), SECRET=process.env.JWT_SECRET||'change-me';
+app.use(helmet()); app.use(cors({origin:process.env.WEB_ORIGIN||'http://localhost:5173'})); app.use(express.json({limit:'1mb'})); app.use(rateLimit({windowMs:60000,limit:300}));
+app.get('/health',async(_req,res)=>{try{await prisma.$queryRaw`SELECT 1`;await redis.ping();res.json({status:'ok',database:'ok',redis:'ok'})}catch{res.status(503).json({status:'degraded'})}});
+const sign=(u:any)=>jwt.sign({sub:u.id,role:u.role},SECRET,{expiresIn:'15m'});
+function auth(req:any,res:any,next:any){const h=req.headers.authorization;if(!h?.startsWith('Bearer '))return res.status(401).json({error:'Authentication required'});try{req.user=jwt.verify(h.slice(7),SECRET);next()}catch{res.status(401).json({error:'Invalid or expired token'})}}
+function allow(...roles:Role[]){return(req:any,res:any,next:any)=>roles.includes(req.user?.role)?next():res.status(403).json({error:'Forbidden'})}
+app.post('/api/auth/register',async(req,res)=>{try{const{name,email,password}=req.body;if(!name||!email||!password||password.length<8)return res.status(400).json({error:'Valid name, email and 8+ character password required'});if(await prisma.user.findUnique({where:{email:email.toLowerCase()}}))return res.status(409).json({error:'Email already registered'});const u=await prisma.user.create({data:{name,email:email.toLowerCase(),passwordHash:await argon2.hash(password),role:'STUDENT'}});res.status(201).json({user:{id:u.id,name:u.name,email:u.email,role:u.role},token:sign(u)})}catch{res.status(500).json({error:'Registration failed'})}});
+app.post('/api/auth/login',async(req,res)=>{const u=await prisma.user.findUnique({where:{email:String(req.body.email||'').toLowerCase()}});if(!u||!(await argon2.verify(u.passwordHash,String(req.body.password||''))))return res.status(401).json({error:'Invalid credentials'});res.json({user:{id:u.id,name:u.name,email:u.email,role:u.role},token:sign(u)})});
+app.get('/api/curricula',auth,async(_req,res)=>res.json(await prisma.curriculum.findMany({where:{archived:false},include:{courses:true},orderBy:{createdAt:'desc'}})));
+app.post('/api/curricula',auth,allow(Role.ADMIN),async(req,res)=>res.status(201).json(await prisma.curriculum.create({data:{title:req.body.title,description:req.body.description}})));
+app.get('/api/courses',auth,async(req,res)=>{const page=Math.max(1,Number(req.query.page||1)),limit=Math.min(50,Math.max(1,Number(req.query.limit||20)));const[items,total]=await prisma.$transaction([prisma.course.findMany({skip:(page-1)*limit,take:limit,include:{curriculum:true},orderBy:{createdAt:'desc'}}),prisma.course.count()]);res.json({items,page,limit,total})});
+app.post('/api/courses',auth,allow(Role.INSTRUCTOR,Role.ADMIN),async(req,res)=>res.status(201).json(await prisma.course.create({data:{title:req.body.title,description:req.body.description,category:req.body.category,curriculumId:req.body.curriculumId}})));
+app.post('/api/offerings',auth,allow(Role.ADMIN),async(req,res)=>res.status(201).json(await prisma.courseOffering.create({data:{courseId:req.body.courseId,semester:req.body.semester,capacity:Number(req.body.capacity),schedule:req.body.schedule||{}}})));
+app.get('/api/offerings',auth,async(_req,res)=>res.json(await prisma.courseOffering.findMany({include:{course:true},orderBy:{semester:'desc'}})));
+app.post('/api/enrollments',auth,allow(Role.STUDENT),async(req,res)=>{const userId=req.user.sub,o=await prisma.courseOffering.findUnique({where:{id:req.body.offeringId},include:{enrollments:true}});if(!o)return res.status(404).json({error:'Offering not found'});if(o.enrollments.length>=o.capacity)return res.status(409).json({error:'Course capacity reached'});try{const e=await prisma.enrollment.create({data:{userId,courseId:o.courseId,offeringId:o.id}});await prisma.progress.create({data:{userId,courseId:o.courseId}}).catch(()=>{});res.status(201).json(e)}catch{res.status(409).json({error:'Already registered or registration conflict'})}});
+app.get('/api/progress/me',auth,async(req,res)=>res.json(await prisma.progress.findMany({where:{userId:req.user.sub},include:{course:true},orderBy:{updatedAt:'desc'}})));
+app.put('/api/progress/:courseId',auth,async(req,res)=>{const completion=Math.min(100,Math.max(0,Number(req.body.completion)));res.json(await prisma.progress.upsert({where:{userId_courseId:{userId:req.user.sub,courseId:req.params.courseId}},create:{userId:req.user.sub,courseId:req.params.courseId,completion},update:{completion,attendance:Number(req.body.attendance||0),grade:req.body.grade}}))});
+app.post('/api/feedback',auth,async(req,res)=>{const rating=Number(req.body.rating);if(!req.body.courseId||!req.body.comment||rating<1||rating>5)return res.status(400).json({error:'Valid course, rating 1-5 and comment required'});res.status(201).json(await prisma.feedback.create({data:{userId:req.user.sub,courseId:req.body.courseId,rating,comment:req.body.comment}}))});
+app.get('/api/feedback/analytics/:courseId',auth,allow(Role.INSTRUCTOR,Role.ADMIN),async(req,res)=>{const rows=await prisma.feedback.findMany({where:{courseId:req.params.courseId},select:{rating:true,sentiment:true}});res.json({total:rows.length,averageRating:rows.length?Number((rows.reduce((a,b)=>a+b.rating,0)/rows.length).toFixed(2)):0})});
+app.post('/api/cipherbot/chat',auth,async(req,res)=>{if(!req.body.message||String(req.body.message).length>4000)return res.status(400).json({error:'Message is required and limited to 4000 characters'});try{const r=await fetch(`${process.env.AI_SERVICE_URL||'http://localhost:8000'}/chat`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({message:req.body.message,user_id:req.user.sub})});res.status(r.status).json(await r.json())}catch{res.status(503).json({error:'AI service unavailable'})}});
+app.use((_req,res)=>res.status(404).json({error:'Not found'}));
+app.listen(PORT,'0.0.0.0',()=>console.log(`API running on ${PORT}`));
