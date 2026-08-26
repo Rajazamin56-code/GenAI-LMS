@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: lms
+      POSTGRES_PASSWORD: lms_password
+      POSTGRES_DB: lms
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lms -d lms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis_data:/data"]
+  api:
+    build: ./apps/api
+    env_file: .env
+    ports: ["4000:4000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+  ai:
+    build: ./apps/ai
+    env_file: .env
+    ports: ["8000:8000"]
+  web:
+    build: ./apps/web
+    environment:
+      VITE_API_URL: http://localhost:4000
+    ports: ["5173:5173"]
+    depends_on: [api]
+volumes:
+  postgres_data:
+  redis_data:
